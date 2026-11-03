@@ -71,16 +71,24 @@ class RheemBLECoordinator(
         service_info: BluetoothServiceInfoBleak,
         seconds_since_last_poll: float | None,
     ) -> bool:
-        """Return whether a connectable adapter can reach the unit and a poll is due."""
-        if self.hass.state is not CoreState.running:
-            return False
-        if not poll_is_due(seconds_since_last_poll, DEFAULT_SCAN_INTERVAL):
-            return False
-        return bool(
-            async_ble_device_from_address(
+        """Return whether a connectable adapter can reach the unit and a poll is due.
+
+        Home Assistant stores this advertisement before the callback and then
+        drops later copies with the same payload. EcoNet advertisements do not
+        change when the readings do, so a poll that is not started has to drop
+        the cached copy. Otherwise the next one never arrives and polling stops.
+        """
+        due = (
+            self.hass.state is CoreState.running
+            and poll_is_due(seconds_since_last_poll, DEFAULT_SCAN_INTERVAL)
+            and async_ble_device_from_address(
                 self.hass, service_info.address, connectable=True
             )
+            is not None
         )
+        if not due:
+            async_clear_advertisement_history(self.hass, self.address)
+        return due
 
     async def _async_poll(
         self, service_info: BluetoothServiceInfoBleak
@@ -107,6 +115,8 @@ class RheemBLECoordinator(
             )
             raise RuntimeError(reason) from err
         finally:
+            # The advertisement that started this poll is already cached.
+            # Drop it so the next identical one can reach _needs_poll.
             async_clear_advertisement_history(self.hass, self.address)
 
     def _async_sync_device_registry(self, data: dict[str, CommandResult]) -> None:
