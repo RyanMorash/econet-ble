@@ -3,22 +3,31 @@
     "step": {
       "user": {
         "title": "Rheem HVAC BLE",
-        "description": "Enter the Bluetooth MAC address of your Rheem HVAC equipment.",
+        "description": "Select a discovered EcoNet device, or enter the Bluetooth MAC address of your Rheem HVAC equipment.",
         "data": {
+          "device": "Device",
           "mac_address": "MAC Address"
         },
         "data_description": {
           "mac_address": "Bluetooth MAC address in XX:XX:XX:XX:XX:XX format"
         }
+      },
+      "bluetooth_confirm": {
+        "title": "Rheem HVAC BLE",
+        "description": "Do you want to set up {name}?"
       }
     },
     "error": {
       "invalid_mac": "Invalid MAC address format. Use XX:XX:XX:XX:XX:XX.",
       "cannot_connect": "Could not connect to the device. Ensure it is powered on and in range.",
-      "unsupported_device": "This device is a water heater, which is not supported by this integration."
+      "unsupported_device": "This device is a water heater, which is not supported by this integration.",
+      "no_device": "Select a discovered device or enter a MAC address.",
+      "unknown": "An unknown error occurred."
     },
     "abort": {
-      "already_configured": "This device is already configured."
+      "already_configured": "This device is already configured.",
+      "not_connectable": "No Bluetooth adapter that can connect to this device was found.",
+      "no_scanner": "No Bluetooth adapter that can connect to devices was found."
     }
   }
 }

@@ -33,42 +33,28 @@ If `onCharacteristicRead/Write` returns status `5` (GATT_INSUFF_AUTHENTICATION),
 
 ### Linux / BlueZ
 
-BlueZ does **not** silently handle peripheral-initiated SMP Security Requests (opcode `0x0b`). Without explicit handling, the furnace disconnects during GATT service discovery with:
+BlueZ does **not** silently handle peripheral-initiated SMP Security Requests (opcode `0x0b`). Without the stack completing that exchange, the furnace can disconnect during GATT service discovery with:
 
 ```
 kernel: Bluetooth: hci0: Unexpected SMP command 0x0b from ...
 ```
 
-**Working sequence on Linux:**
+That behavior is protocol background. The Home Assistant integration does not register a pairing agent, call `Pair()`, or use BlueZ D-Bus. It connects with `establish_connection()` and the `BLEDevice` from Home Assistant's Bluetooth integration:
 
 ```
-1. Register NoInputNoOutput pairing agent as default (handles Just Works SMP)
-2. D-Bus Pair() on the device
-   → BlueZ connects, sends SMP Pairing Request (central-initiated)
-   → Furnace responds, Just Works exchange completes
-   → Bond stored in BlueZ (/var/lib/bluetooth/<adapter>/<device>/)
-3. Set device Trusted=True
-4. D-Bus Disconnect() + sleep(1s)
-5. Unregister agent
-6. BleakClient.connect() via establish_connection()
-   → BlueZ re-encrypts link using stored bond key
-   → No new SMP exchange needed
-   → GATT service discovery succeeds
-7. start_notify(rx_uuid)
+1. Home Assistant reports a connectable advertisement for EcoNet-*
+2. async_ble_device_from_address(hass, address, connectable=True)
+3. establish_connection(BleakClient, ble_device, name)
+4. start_notify(rx_uuid)
+5. Read status commands, then disconnect
 ```
-
-## Why Registering the Agent Alone Is Not Enough
-
-Registering a NoInputNoOutput agent without calling `Pair()` first leaves BlueZ to negotiate SMP as a **responder** (reacting to the furnace's Security Request) rather than as an **initiator**. In practice, BlueZ's responder path on kernels tested (~6.x) does not complete the exchange fast enough during `BleakClient.connect()`, causing the device to disconnect before service discovery.
-
-Calling `Pair()` explicitly makes BlueZ the **initiator**, which reliably completes the SMP exchange before GATT operations begin.
 
 ## Adapter Selection
 
 - Do **not** hardcode `hci0` (or any adapter). The system may have multiple adapters.
-- In Home Assistant, use `async_ble_device_from_address(hass, mac, connectable=True)` to get the best `BLEDevice` (highest RSSI, any adapter or ESPHome proxy).
-- Pass the `BLEDevice` to `establish_connection()`. It encodes the adapter/proxy choice.
-- The D-Bus device path for `Pair()` is in `ble_device.details["path"]` (e.g., `/org/bluez/hci1/dev_F5_C6_AE_62_DE_28`). Fall back to an ObjectManager scan if not present.
+- In Home Assistant, use `async_ble_device_from_address(hass, mac, connectable=True)` to get the best `BLEDevice` (highest RSSI, any connectable adapter or proxy).
+- Pass the `BLEDevice` to `establish_connection()`. It encodes the adapter choice.
+- Do not open a D-Bus connection to BlueZ from the integration.
 
 ## Command Protocol
 
