@@ -1,73 +1,89 @@
-"""Sensor platform for Rheem HVAC BLE integration."""
+"""Sensor platform for the Rheem HVAC BLE integration."""
 
-from __future__ import annotations
+from typing import override
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.bluetooth.passive_update_processor import (
+    PassiveBluetoothDataProcessor,
+    PassiveBluetoothDataUpdate,
+    PassiveBluetoothEntityKey,
+)
+from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from . import RheemBLEConfigEntry, RheemBLECoordinator
-from .const import DOMAIN, RheemSensorMetadata, SENSOR_DESCRIPTIONS
-from .rheem_ble import COMMAND_LABELS
+from .const import SENSOR_DESCRIPTIONS, RheemSensorMetadata
+from .coordinator import RheemBLEConfigEntry, RheemBLECoordinator
+from .entity import RheemBLEEntity, build_device_info
+from .rheem_ble import COMMAND_LABELS, CommandResult, sensor_native_value
+
+PARALLEL_UPDATES = 0
 
 
-class RheemBLESensor(CoordinatorEntity[RheemBLECoordinator], SensorEntity):
-    """Representation of a Rheem BLE sensor."""
+def _expects_numeric(metadata: RheemSensorMetadata) -> bool:
+    """Return True when Home Assistant expects a number from this sensor."""
+    return metadata.state_class is not None or metadata.device_class is not None
 
-    has_entity_name = True
 
-    def __init__(
-        self,
-        coordinator: RheemBLECoordinator,
-        metadata: RheemSensorMetadata,
-    ) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator)
-        self._command = metadata.command
-        self._attr_unique_id = f"{coordinator.mac_address}_{metadata.command}"
-        self._attr_translation_key = metadata.command.lower()
-        self._attr_name = COMMAND_LABELS.get(metadata.command, metadata.command)
-        self._attr_device_class = metadata.device_class
-        self._attr_state_class = metadata.state_class
-        self._attr_native_unit_of_measurement = metadata.native_unit_of_measurement
-        self._attr_entity_category = metadata.entity_category
-        self._attr_icon = metadata.icon
-        self._attr_device_info = coordinator.device_info
+def _description(metadata: RheemSensorMetadata) -> SensorEntityDescription:
+    """Build the entity description for one command."""
+    return SensorEntityDescription(
+        key=metadata.command,
+        device_class=metadata.device_class,
+        state_class=metadata.state_class,
+        native_unit_of_measurement=metadata.native_unit_of_measurement,
+        entity_category=metadata.entity_category,
+        icon=metadata.icon,
+        name=COMMAND_LABELS.get(metadata.command, metadata.command),
+    )
+
+
+def _sensor_update(
+    coordinator: RheemBLECoordinator, data: dict[str, CommandResult]
+) -> PassiveBluetoothDataUpdate[float | str | None]:
+    """Turn a status poll into sensor entities.
+
+    An empty map means the update came from an advertisement and changes nothing.
+    """
+    if not data:
+        return PassiveBluetoothDataUpdate()
+
+    descriptions: dict[PassiveBluetoothEntityKey, SensorEntityDescription] = {}
+    names: dict[PassiveBluetoothEntityKey, str] = {}
+    values: dict[PassiveBluetoothEntityKey, float | str | None] = {}
+    for command, metadata in SENSOR_DESCRIPTIONS.items():
+        result = data.get(command)
+        # OBJ_NOT_FOUND is never created. Any other error is left out of this
+        # update so an existing entity keeps its previous value.
+        if result is None or result.error:
+            continue
+        key = PassiveBluetoothEntityKey(command, None)
+        label = COMMAND_LABELS.get(command, command)
+        descriptions[key] = _description(metadata)
+        names[key] = label
+        values[key] = sensor_native_value(
+            result, numeric=_expects_numeric(metadata)
+        )
+
+    return PassiveBluetoothDataUpdate(
+        devices={
+            None: build_device_info(
+                coordinator.address, coordinator.equipment_type, data
+            )
+        },
+        entity_descriptions=descriptions,
+        entity_names=names,
+        entity_data=values,
+    )
+
+
+class RheemBLESensor(RheemBLEEntity, SensorEntity):
+    """A Rheem BLE sensor."""
 
     @property
-    def available(self) -> bool:
-        """Return True if the sensor has valid data."""
-        if not super().available or self.coordinator.data is None:
-            return False
-        result = self.coordinator.data.get(self._command)
-        return result is not None and result.error is None
-
-    @property
-    def _expects_numeric(self) -> bool:
-        """Return True if HA expects a numeric value from this sensor."""
-        return self._attr_state_class is not None or self._attr_device_class is not None
-
-    @property
+    @override
     def native_value(self) -> float | str | None:
         """Return the sensor value."""
-        if self.coordinator.data is None:
-            return None
-        result = self.coordinator.data.get(self._command)
-        if result is None or result.error or result.value is None:
-            return None
-
-        if self._expects_numeric:
-            # Numeric sensor: only return a float. BLE commands can
-            # unexpectedly return text (e.g. HTEXOTMP → "Closed",
-            # STRENGT2 → "Off") when the equipment is inactive.
-            try:
-                return round(float(result.value), 1)
-            except (ValueError, TypeError):
-                return None
-
-        # Text sensor
-        return str(result.value).strip()
+        return self.processor.entity_data.get(self.entity_key)
 
 
 async def async_setup_entry(
@@ -77,11 +93,12 @@ async def async_setup_entry(
 ) -> None:
     """Set up Rheem BLE sensors from a config entry."""
     coordinator = entry.runtime_data
-    equipment_commands = set(coordinator.equipment_commands)
-
-    entities = [
-        RheemBLESensor(coordinator, metadata)
-        for command, metadata in SENSOR_DESCRIPTIONS.items()
-        if command in equipment_commands
-    ]
-    async_add_entities(entities)
+    processor = PassiveBluetoothDataProcessor(
+        lambda data: _sensor_update(coordinator, data)
+    )
+    entry.async_on_unload(
+        processor.async_add_entities_listener(RheemBLESensor, async_add_entities)
+    )
+    entry.async_on_unload(
+        coordinator.async_register_processor(processor, SensorEntityDescription)
+    )

@@ -73,7 +73,7 @@ EQUIPMENT_BOARD_ADDR = {
     EquipmentType.ODU: BOARD_ADDR_ODU,
     EquipmentType.HEAT_PUMP: BOARD_ADDR_ODU,
     EquipmentType.CONDENSING_UNIT: BOARD_ADDR_ODU,
-    EquipmentType.MWH: BOARD_ADDR_ODU,
+    EquipmentType.MWH: BOARD_ADDR_HWH,
     EquipmentType.HWH: BOARD_ADDR_HWH,
 }
 
@@ -477,6 +477,67 @@ PRODUCT_TYPE_MAP = {
 }
 
 
+# Text values that the equipment reports as the on state of a binary point.
+# OPEN and CLOSED are both included because contact polarity differs by
+# command and captured responses are not available to split them.
+ON_TEXT_VALUES = {"ON", "OPEN", "ACTIVE", "YES", "TRUE", "1", "CLOSED"}
+
+
+def redact_address(address: str) -> str:
+    """Mask the middle of an address.
+
+    The same 4-character prefix and suffix rule as Home Assistant's
+    ``partial_redact``. This module stays free of Home Assistant imports so
+    the command-line tool and the unit tests can load it on their own.
+    """
+    if len(address) < 16:
+        return "**REDACTED**"
+    return f"{address[:4]}***{address[-4:]}"
+
+
+def commands_from_advertisement() -> dict:
+    """Return the command map carried by an advertisement.
+
+    EcoNet advertisements do not include equipment readings.
+    """
+    return {}
+
+
+def poll_is_due(seconds_since_last_poll: float | None, interval: float) -> bool:
+    """Return True when enough time has passed to poll the equipment again."""
+    return seconds_since_last_poll is None or seconds_since_last_poll >= interval
+
+
+def sensor_native_value(result: CommandResult, *, numeric: bool) -> float | str | None:
+    """Convert a command result into a sensor state.
+
+    Numeric sensors drop unexpected text, such as a closed heat exchanger
+    reporting ``Closed`` instead of a temperature.
+    """
+    if result.error or result.value is None:
+        return None
+    if numeric:
+        try:
+            return round(float(result.value), 1)
+        except (TypeError, ValueError):
+            return None
+    return str(result.value).strip()
+
+
+def binary_is_on(result: CommandResult) -> bool | None:
+    """Convert a command result into a binary sensor state."""
+    if result.error or result.value is None:
+        return None
+    if result.data_type in ("ieee", "enum_number"):
+        try:
+            return float(result.value) >= 1.0
+        except (TypeError, ValueError):
+            return None
+    if result.data_type in ("text", "enum_text"):
+        return str(result.value).strip().upper() in ON_TEXT_VALUES
+    return None
+
+
 # ---------------------------------------------------------------------------
 # BLE Client
 # ---------------------------------------------------------------------------
@@ -502,221 +563,12 @@ class RheemBLEClient:
 
     # -- connection ----------------------------------------------------------
 
-    def _remove_device_cache(self):
-        """Remove device from BlueZ cache to clear stale state.
-
-        This clears leftover notification FDs and cached services that can
-        cause 'Notify acquired' or 'NotPermitted' errors on reconnection.
-        """
-        import subprocess
-        try:
-            result = subprocess.run(
-                ["bluetoothctl", "remove", self.address],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                logger.info("Removed %s from BlueZ cache", self.address)
-            else:
-                logger.debug("bluetoothctl remove: %s",
-                             result.stderr.strip())
-        except FileNotFoundError:
-            logger.debug("bluetoothctl not found")
-        except Exception as e:
-            logger.debug("Could not remove device: %s", e)
-
-    async def _register_pairing_agent(self):
-        """Register a NoInputNoOutput BLE pairing agent on the system D-Bus.
-
-        The furnace sends an SMP Security Request (kernel: "unexpected SMP
-        command 0x0b") right after the BLE connection is established.  Without
-        a registered agent, BlueZ rejects the request and disconnects the
-        device before any GATT operations can run.  This registers a minimal
-        Just Works agent so BlueZ can complete ephemeral encryption without
-        bonding or an explicit Pair() call.
-
-        Returns (bus, agent_path) on success, (None, None) on failure.  The
-        caller is responsible for calling _unregister_pairing_agent with the
-        returned values.
-        """
-        try:
-            from dbus_fast.aio import MessageBus
-            from dbus_fast.service import ServiceInterface, method
-            from dbus_fast import BusType
-        except ImportError:
-            logger.debug("dbus-fast not available; connecting without pairing agent")
-            return None, None
-
-        class _NoInputNoOutput(ServiceInterface):
-            def __init__(self):
-                super().__init__("org.bluez.Agent1")
-
-            @method()
-            def Release(self) -> None:
-                pass
-
-            @method()
-            def RequestConfirmation(self, device: 'o', passkey: 'u') -> None:
-                pass
-
-            @method()
-            def RequestPinCode(self, device: 'o') -> 's':
-                return ""
-
-            @method()
-            def DisplayPinCode(self, device: 'o', pincode: 's') -> None:
-                pass
-
-            @method()
-            def RequestPasskey(self, device: 'o') -> 'u':
-                return 0
-
-            @method()
-            def DisplayPasskey(self, device: 'o', passkey: 'u', entered: 'q') -> None:
-                pass
-
-            @method()
-            def AuthorizeService(self, device: 'o', uuid: 's') -> None:
-                pass
-
-            @method()
-            def Cancel(self) -> None:
-                pass
-
-        agent_path = "/rheem_ble/pairing_agent"
-        try:
-            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            bus.export(agent_path, _NoInputNoOutput())
-
-            introspection = await bus.introspect("org.bluez", "/org/bluez")
-            proxy = bus.get_proxy_object("org.bluez", "/org/bluez", introspection)
-            agent_mgr = proxy.get_interface("org.bluez.AgentManager1")
-            await agent_mgr.call_register_agent(agent_path, "NoInputNoOutput")
-            await agent_mgr.call_request_default_agent(agent_path)
-
-            logger.debug("NoInputNoOutput pairing agent registered")
-            return bus, agent_path
-        except Exception as e:
-            logger.warning(
-                "Pairing agent registration failed (%s); connecting without agent", e
-            )
-            return None, None
-
-    async def _unregister_pairing_agent(self, bus, agent_path: str) -> None:
-        """Unregister the pairing agent and close the D-Bus connection."""
-        if bus is None:
-            return
-        try:
-            introspection = await bus.introspect("org.bluez", "/org/bluez")
-            proxy = bus.get_proxy_object("org.bluez", "/org/bluez", introspection)
-            agent_mgr = proxy.get_interface("org.bluez.AgentManager1")
-            await agent_mgr.call_unregister_agent(agent_path)
-        except Exception:
-            pass
-        try:
-            bus.disconnect()
-        except Exception:
-            pass
-
-    async def _pair_via_dbus(self, bus) -> None:
-        """Call BlueZ Pair() to complete SMP key exchange before BleakClient connects.
-
-        The furnace sends an SMP Security Request right after BLE connection.
-        Relying on a registered agent to handle it inline during BleakClient's
-        service discovery is unreliable — BlueZ needs to complete the SMP
-        handshake as the central initiator via an explicit Pair() call first.
-
-        After Pair() succeeds the bond is stored in BlueZ. BleakClient then
-        reconnects and inherits the encrypted session, allowing GATT service
-        discovery to proceed without another SMP exchange.
-
-        The device D-Bus path is derived from ble_device.details["path"] when
-        available (HA always provides this), or found via ObjectManager scan.
-        """
-        if bus is None:
-            return
-
-        try:
-            from dbus_fast import Variant
-        except ImportError:
-            return
-
-        device_path = None
-        if self._ble_device is not None:
-            details = getattr(self._ble_device, 'details', {}) or {}
-            device_path = details.get('path')
-
-        if not device_path:
-            addr_key = self.address.upper().replace(':', '_')
-            try:
-                om_intro = await bus.introspect("org.bluez", "/")
-                om_proxy = bus.get_proxy_object("org.bluez", "/", om_intro)
-                om = om_proxy.get_interface("org.freedesktop.DBus.ObjectManager")
-                objects = await om.call_get_managed_objects()
-                for path in objects:
-                    if addr_key in str(path):
-                        device_path = path
-                        break
-            except Exception as e:
-                logger.debug("ObjectManager lookup failed: %s", e)
-
-        if not device_path:
-            logger.warning(
-                "Cannot find D-Bus path for %s; skipping Pair()", self.address
-            )
-            return
-
-        logger.debug("D-Bus pairing device at %s", device_path)
-        try:
-            dev_intro = await bus.introspect("org.bluez", device_path)
-            dev_proxy = bus.get_proxy_object("org.bluez", device_path, dev_intro)
-            device_iface = dev_proxy.get_interface("org.bluez.Device1")
-            props_iface = dev_proxy.get_interface("org.freedesktop.DBus.Properties")
-
-            paired_var = await props_iface.call_get("org.bluez.Device1", "Paired")
-            already_paired = bool(paired_var.value)
-
-            if not already_paired:
-                logger.debug("Calling Pair() on %s", device_path)
-                await asyncio.wait_for(device_iface.call_pair(), timeout=30.0)
-                logger.info("Paired with %s", self.address)
-            else:
-                logger.debug("Already paired with %s", self.address)
-
-            await props_iface.call_set(
-                "org.bluez.Device1", "Trusted", Variant("b", True)
-            )
-
-            conn_var = await props_iface.call_get("org.bluez.Device1", "Connected")
-            if bool(conn_var.value):
-                await device_iface.call_disconnect()
-                await asyncio.sleep(1.0)
-
-        except asyncio.TimeoutError:
-            logger.warning("Pair() timed out for %s", self.address)
-        except Exception as e:
-            logger.warning(
-                "D-Bus Pair() failed for %s (%s); BleakClient will attempt direct connect",
-                self.address, e,
-            )
-
     async def connect(self):
-        """Connect to the BLE device via HA's bluetooth infrastructure.
+        """Connect using the BLEDevice Home Assistant already selected.
 
-        Sequence:
-        1. Register NoInputNoOutput agent (handles Just Works SMP confirmation).
-        2. Call BlueZ Pair() via D-Bus — forces SMP exchange to complete before
-           BleakClient tries to discover services.
-        3. Disconnect the D-Bus-initiated connection so BleakClient can connect.
-        4. Unregister agent (no longer needed; bond is stored in BlueZ).
-        5. establish_connection() — BleakClient re-uses the stored bond key,
-           link comes up encrypted, GATT service discovery succeeds.
+        A new Bleak client is created for every connection. The Bluetooth
+        integration chooses the adapter, including a remote proxy.
         """
-        bus, agent_path = await self._register_pairing_agent()
-        try:
-            await self._pair_via_dbus(bus)
-        finally:
-            await self._unregister_pairing_agent(bus, agent_path)
-
         device = self._ble_device if self._ble_device is not None else self.address
         try:
             self._client = await establish_connection(
@@ -725,12 +577,12 @@ class RheemBLEClient:
                 self.address,
                 max_attempts=self.MAX_CONNECT_ATTEMPTS,
             )
-        except Exception as e:
+        except Exception as err:
             raise RuntimeError(
-                f"Failed to connect after {self.MAX_CONNECT_ATTEMPTS} attempts: {e}"
-            ) from e
+                f"Failed to connect after {self.MAX_CONNECT_ATTEMPTS} attempts: {err}"
+            ) from err
 
-        logger.info("Connected to %s", self.address)
+        logger.info("Connected to %s", redact_address(self.address))
         self._find_characteristics()
 
         if not self._client.is_connected:
@@ -829,8 +681,21 @@ class RheemBLEClient:
         self._response_data.extend(data)
         self._response_event.set()
 
+    def _response_complete(self) -> bool:
+        """Return True when the buffer holds one full response packet."""
+        # Header is 14 bytes; data_len at byte 10 gives the payload size.
+        if len(self._response_data) < 15:
+            return False
+        data_len = self._response_data[10] & 0xFF
+        return len(self._response_data) >= data_len + 14
+
     async def _send_and_receive(self, packet: bytes) -> bytes:
-        """Send a command and collect the response."""
+        """Send a command and collect the response.
+
+        The notification can arrive before ``write_gatt_char`` returns.
+        Completeness is checked before waiting so that response is not
+        held until the command timeout.
+        """
         self._response_data.clear()
         self._response_event.clear()
 
@@ -842,26 +707,18 @@ class RheemBLEClient:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.timeout
 
-        while True:
+        while not self._response_complete():
             remaining = deadline - loop.time()
             if remaining <= 0:
                 break
-
-            self._response_event.clear()
             try:
                 await asyncio.wait_for(
                     self._response_event.wait(),
-                    timeout=max(remaining, 0),
+                    timeout=remaining,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 break
-
-            # Check if we have a complete packet.
-            # Header is 14 bytes; data_len at byte 10 gives payload size.
-            if len(self._response_data) >= 15:
-                data_len = self._response_data[10] & 0xFF
-                if len(self._response_data) >= data_len + 14:
-                    break
+            self._response_event.clear()
 
         return bytes(self._response_data)
 

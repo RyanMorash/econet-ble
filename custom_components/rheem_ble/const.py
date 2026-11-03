@@ -19,6 +19,10 @@ from homeassistant.const import (
 
 DOMAIN = "rheem_ble"
 DEFAULT_SCAN_INTERVAL = 60
+SCAN_DURATION = 10
+DEVICE_NAME_PREFIX = "EcoNet-"
+CONF_MAC_ADDRESS = "mac_address"
+CONF_DEVICE = "device"
 
 
 @dataclass(frozen=True)

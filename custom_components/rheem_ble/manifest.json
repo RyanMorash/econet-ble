@@ -1,10 +1,17 @@
 {
   "domain": "rheem_ble",
   "name": "Rheem HVAC BLE",
+  "bluetooth": [
+    {
+      "connectable": true,
+      "local_name": "EcoNet-*"
+    }
+  ],
   "codeowners": [],
   "config_flow": true,
-  "dependencies": ["bluetooth"],
+  "dependencies": ["bluetooth", "bluetooth_adapters"],
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "requirements": ["bleak>=0.21.0", "bleak-retry-connector>=3.0.0", "dbus-fast>=1.80.0"],
-  "version": "0.1.0"
+  "requirements": [],
+  "version": "0.2.0"
 }

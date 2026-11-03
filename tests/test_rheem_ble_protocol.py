@@ -16,6 +16,9 @@ build_read_packet = _mod.build_read_packet
 parse_response = _mod.parse_response
 encode_command_name = _mod.encode_command_name
 BOARD_ADDR_FURNACE = _mod.BOARD_ADDR_FURNACE
+BOARD_ADDR_HWH = _mod.BOARD_ADDR_HWH
+EQUIPMENT_BOARD_ADDR = _mod.EQUIPMENT_BOARD_ADDR
+EquipmentType = _mod.EquipmentType
 DATA_TYPE_IEEE = _mod.DATA_TYPE_IEEE
 DATA_TYPE_TEXT = _mod.DATA_TYPE_TEXT
 DATA_TYPE_ENUMERATED_TEXT = _mod.DATA_TYPE_ENUMERATED_TEXT
@@ -91,6 +94,12 @@ class TestBuildReadPacket:
         p1 = build_read_packet("HVACMODE", BOARD_ADDR_FURNACE)
         p2 = build_read_packet("CFM_CMND", BOARD_ADDR_FURNACE)
         assert p1 != p2
+
+    def test_mwh_uses_water_heater_board(self):
+        """MWH reads go to the water-heater board, not the outdoor unit."""
+        assert EQUIPMENT_BOARD_ADDR[EquipmentType.MWH] == BOARD_ADDR_HWH
+        packet = build_read_packet("WHTRSETP", EQUIPMENT_BOARD_ADDR[EquipmentType.MWH])
+        assert packet[:4] == BOARD_ADDR_HWH
 
 
 # ---------------------------------------------------------------------------
